@@ -521,7 +521,6 @@ def test_snapshot_partitioned_different_schemas(tmp_path):
     expected2["c"] = date(2021, 1, 2)
     expected2["d"] = np.int32(2)
     expected = pd.concat([expected1, expected2])[["a", "c", "b", "d"]].reset_index(drop=True)
-    # `dtype="str"`: object dtype holding None on pandas 2, the default string dtype on pandas 3.
     expected["b"] = pd.Series([None if pd.isna(v) else v for v in expected["b"]], dtype="str")
 
     expected_arrow_pdf = expected.copy()
@@ -1113,7 +1112,6 @@ def test_table_changes_to_pandas_non_partitioned_delta(tmp_path):
 
 
 def test_concat_file_frames_keeps_dtypes_of_columns_missing_from_a_file():
-    # A file written before columns were added: the reader fills the missing columns with None.
     with_columns = pa.table(
         {
             "x": pa.array([1], pa.int64()),
@@ -1128,7 +1126,6 @@ def test_concat_file_frames_keeps_dtypes_of_columns_missing_from_a_file():
 
     merged = _concat_file_frames([without_columns, with_columns])
 
-    # Same dtypes as pandas 2 gives, which ignores all-null columns when picking concat dtypes.
     assert merged["d"].dtype == np.float64
     assert merged["t"].dtype == pd.DatetimeTZDtype("us", "UTC")
     assert merged["s"].dtype == with_columns["s"].dtype
