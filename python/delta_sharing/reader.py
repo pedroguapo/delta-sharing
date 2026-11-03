@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 from collections import defaultdict
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 from json import loads, dump
 from urllib.request import getproxies
@@ -32,6 +32,30 @@ from delta_sharing.converter import get_empty_table, to_arrow_schema, to_arrow_t
 from delta_sharing.protocol import AddCdcFile, CdfOptions, FileAction, Table
 from delta_sharing.rest_client import DataSharingRestClient
 from delta_sharing.fake_checkpoint import get_fake_checkpoint_byte_array
+
+_PANDAS_3 = int(pd.__version__.split(".")[0]) >= 3
+
+
+def _can_hold_null(dtype) -> bool:
+    return (
+        pd.api.types.is_float_dtype(dtype)
+        or pd.api.types.is_datetime64_any_dtype(dtype)
+        or isinstance(dtype, pd.StringDtype)
+    )
+
+
+def _concat_file_frames(pdfs: List[pd.DataFrame], filled: List[Set[str]]) -> pd.DataFrame:
+    if _PANDAS_3 and len(pdfs) > 1:
+        for col in set().union(*filled):
+            target = next(
+                (pdf[col].dtype for pdf, f in zip(pdfs, filled) if col not in f and col in pdf),
+                None,
+            )
+            if target is not None and _can_hold_null(target):
+                for pdf, f in zip(pdfs, filled):
+                    if col in f:
+                        pdf[col] = pd.Series(index=pdf.index, dtype=target)
+    return pd.concat(pdfs, axis=0, ignore_index=True, copy=False)
 
 
 class DeltaSharingReader:
@@ -199,21 +223,23 @@ class DeltaSharingReader:
 
         converters = to_converters(schema_json)
 
+        pdfs = []
+        filled = []
         if self._limit is None:
-            pdfs = [
-                DeltaSharingReader._to_pandas(
+            for file in response.add_files:
+                pdf, filled_cols = DeltaSharingReader._to_pandas(
                     file, converters, False, None, self._convert_in_batches
                 )
-                for file in response.add_files
-            ]
+                pdfs.append(pdf)
+                filled.append(filled_cols)
         else:
             left = self._limit
-            pdfs = []
             for file in response.add_files:
-                pdf = DeltaSharingReader._to_pandas(
+                pdf, filled_cols = DeltaSharingReader._to_pandas(
                     file, converters, False, left, self._convert_in_batches
                 )
                 pdfs.append(pdf)
+                filled.append(filled_cols)
                 left -= len(pdf)
                 assert (
                     left >= 0
@@ -221,12 +247,7 @@ class DeltaSharingReader:
                 if left == 0:
                     break
 
-        merged = pd.concat(
-            pdfs,
-            axis=0,
-            ignore_index=True,
-            copy=False,
-        )
+        merged = _concat_file_frames(pdfs, filled)
 
         col_map = {}
         for col in merged.columns:
@@ -489,13 +510,15 @@ class DeltaSharingReader:
             return get_empty_table(schema_with_cdf)
 
         pdfs = []
+        filled = []
         for action in response.actions:
-            pdf = DeltaSharingReader._to_pandas(
+            pdf, filled_cols = DeltaSharingReader._to_pandas(
                 action, converters, True, None, self._convert_in_batches
             )
             pdfs.append(pdf)
+            filled.append(filled_cols)
 
-        merged = pd.concat(pdfs, axis=0, ignore_index=True, copy=False)
+        merged = _concat_file_frames(pdfs, filled)
 
         col_map = {}
         for col in merged.columns:
@@ -528,7 +551,7 @@ class DeltaSharingReader:
         for_cdf: bool,
         limit: Optional[int],
         convert_in_batches: bool,
-    ) -> pd.DataFrame:
+    ) -> Tuple[pd.DataFrame, Set[str]]:
         filesystem = DeltaSharingReader._parquet_filesystem(action.url)
         pa_file = ParquetFile(action.url, filesystem=filesystem)
 
@@ -563,16 +586,20 @@ class DeltaSharingReader:
         for col in pdf.columns:
             lowered_cols.add(col.lower())
 
+        filled = set()
         for col, converter in converters.items():
             lowered = col.lower()
             if lowered not in lowered_cols:
                 if col in action.partition_values:
                     if converter is not None:
-                        pdf[col] = converter(action.partition_values[col])
+                        value = converter(action.partition_values[col])
                     else:
                         raise ValueError("Cannot partition on binary or complex columns")
                 else:
-                    pdf[col] = None
+                    value = None
+                pdf[col] = value
+                if pd.isna(value):
+                    filled.add(col)
 
         if for_cdf:
             # Add the change type col name to non cdc actions.
@@ -588,7 +615,7 @@ class DeltaSharingReader:
             if action.timestamp is not None:
                 assert DeltaSharingReader._commit_timestamp_col_name() not in pdf.columns
                 pdf[DeltaSharingReader._commit_timestamp_col_name()] = action.timestamp
-        return pdf
+        return pdf, filled
 
     @staticmethod
     def _to_record_batches(
