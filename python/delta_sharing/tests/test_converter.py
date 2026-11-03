@@ -23,7 +23,12 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 
-from delta_sharing.converter import get_empty_table, to_arrow_schema, to_converter
+from delta_sharing.converter import (
+    get_empty_table,
+    get_empty_table_from_arrow_schema,
+    to_arrow_schema,
+    to_converter,
+)
 
 
 def test_to_converter_boolean():
@@ -157,3 +162,14 @@ def test_to_arrow_schema():
             pa.field("map", pa.map_(pa.string(), pa.int32())),
         ]
     )
+
+
+def test_get_empty_table_from_arrow_schema():
+    schema = pa.schema([pa.field("a", pa.int64()), pa.field("b", pa.string())])
+    pdf = get_empty_table_from_arrow_schema(schema)
+    assert pdf.empty
+    assert list(pdf.columns) == ["a", "b"]
+    # Non-string columns keep the previous `pd.DataFrame(columns=...)` behavior.
+    pd.testing.assert_series_equal(pdf["a"], pd.DataFrame(columns=["a"])["a"])
+    # Strings match non-empty reads: object on pandas 2, the default string dtype on pandas 3.
+    assert pdf["b"].dtype == pa.table({"b": pa.array(["x"])}).to_pandas()["b"].dtype

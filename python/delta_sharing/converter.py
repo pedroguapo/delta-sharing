@@ -45,7 +45,8 @@ def _get_dummy_column(schema_type):
     elif isinstance(schema_type, str) and schema_type.startswith("decimal"):
         return pd.Series([0], dtype=np.dtype("O"))
     elif schema_type == "string":
-        return pd.Series([0], dtype=np.dtype("O"))
+        # Object dtype on pandas 2, default string dtype on pandas 3 (same as non-empty reads).
+        return pd.Series([""], dtype="str")
     elif schema_type == "date":
         return pd.Series([pd.Timestamp(0).date()])
     elif schema_type == "timestamp":
@@ -72,6 +73,26 @@ def get_empty_table(schema_json: dict) -> pd.DataFrame:
         {field["name"]: _get_dummy_column(field["type"]) for field in schema_json["fields"]}
     )
     return dummy_table.iloc[0:0]
+
+
+def get_empty_table_from_arrow_schema(schema: pa.Schema) -> pd.DataFrame:
+    """
+    Empty table with the column names of an Arrow schema. String columns use dtype "str"
+    (object on pandas 2, the default string dtype on pandas 3) to match non-empty reads.
+    Other columns stay object dtype.
+    :param schema: Arrow schema of the scan result
+    :return: empty table with the schema's columns
+    """
+    string_types = (pa.types.is_string, pa.types.is_large_string, pa.types.is_string_view)
+    return pd.DataFrame(
+        {
+            field.name: pd.Series(
+                [], dtype="str" if any(is_type(field.type) for is_type in string_types) else object
+            )
+            for field in schema
+        },
+        columns=schema.names,
+    )
 
 
 def to_converters(schema_json: dict) -> Dict[str, Callable[[str], Any]]:

@@ -28,10 +28,55 @@ import tempfile
 from pyarrow.dataset import dataset
 from pyarrow.parquet import ParquetFile
 
-from delta_sharing.converter import get_empty_table, to_arrow_schema, to_arrow_type, to_converters
+from delta_sharing.converter import (
+    get_empty_table,
+    get_empty_table_from_arrow_schema,
+    to_arrow_schema,
+    to_arrow_type,
+    to_converters,
+)
 from delta_sharing.protocol import AddCdcFile, CdfOptions, FileAction, Table
 from delta_sharing.rest_client import DataSharingRestClient
 from delta_sharing.fake_checkpoint import get_fake_checkpoint_byte_array
+
+# pandas 3 always uses Copy-on-Write: it ignores `pd.concat(copy=...)` and warns when it's passed.
+# pandas 2 copies by default, so keep passing copy=False there to avoid the extra memory.
+_PANDAS_3 = int(pd.__version__.split(".")[0]) >= 3
+_CONCAT_KWARGS: Dict[str, Any] = {} if _PANDAS_3 else {"copy": False}
+
+
+def _can_hold_null(dtype) -> bool:
+    return (
+        pd.api.types.is_float_dtype(dtype)
+        or pd.api.types.is_datetime64_any_dtype(dtype)
+        or pd.api.types.is_timedelta64_dtype(dtype)
+        or isinstance(dtype, pd.StringDtype)
+    )
+
+
+def _concat_file_frames(pdfs: List[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Concatenate per-file frames, keeping column dtypes stable on pandas 3.
+
+    A column missing from a file (or a null partition value) is filled with None, which gives an
+    all-null object column. pandas 2 ignores all-null columns when it picks the concat dtype;
+    pandas 3 doesn't, so a str/float/datetime column would turn into object. On pandas 3, give
+    such all-null columns the dtype the other files have, when that dtype can hold nulls.
+    """
+    if _PANDAS_3 and len(pdfs) > 1:
+        all_null: List[Tuple[pd.DataFrame, str]] = []
+        target_dtypes: Dict[str, Any] = {}
+        for pdf in pdfs:
+            for col in pdf.columns:
+                if pdf[col].first_valid_index() is None:
+                    all_null.append((pdf, col))
+                elif col not in target_dtypes:
+                    target_dtypes[col] = pdf[col].dtype
+        for pdf, col in all_null:
+            target = target_dtypes.get(col)
+            if target is not None and target != pdf[col].dtype and _can_hold_null(target):
+                pdf[col] = pd.Series(index=pdf.index, dtype=target)
+    return pd.concat(pdfs, axis=0, ignore_index=True, **_CONCAT_KWARGS)
 
 
 class DeltaSharingReader:
@@ -143,13 +188,12 @@ class DeltaSharingReader:
         try:
             # The table is empty so use the schema to return an empty table with correct col names
             if num_files == 0:
-                schema = batches.schema
-                return pd.DataFrame(columns=schema.names)
+                return get_empty_table_from_arrow_schema(batches.schema)
 
             if self._convert_in_batches:
                 pdfs = [batch.to_pandas(self_destruct=True) for batch in batches]
                 print(f"Received {len(pdfs)} batches of data.")
-                result = pd.concat(pdfs, axis=0, ignore_index=True, copy=False)
+                result = pd.concat(pdfs, axis=0, ignore_index=True, **_CONCAT_KWARGS)
             else:
                 result = pa.Table.from_batches(batches).to_pandas(self_destruct=True)
 
@@ -221,12 +265,7 @@ class DeltaSharingReader:
                 if left == 0:
                     break
 
-        merged = pd.concat(
-            pdfs,
-            axis=0,
-            ignore_index=True,
-            copy=False,
-        )
+        merged = _concat_file_frames(pdfs)
 
         col_map = {}
         for col in merged.columns:
@@ -460,11 +499,10 @@ class DeltaSharingReader:
 
             scan_result = scan.execute(interface)
             if num_versions_with_action == 0:
-                schema = scan_result.schema
-                result = pd.DataFrame(columns=schema.names)
+                result = get_empty_table_from_arrow_schema(scan_result.schema)
             elif self._convert_in_batches:
                 pdfs = [batch.to_pandas(self_destruct=True) for batch in scan_result]
-                result = pd.concat(pdfs, axis=0, ignore_index=True, copy=False)
+                result = pd.concat(pdfs, axis=0, ignore_index=True, **_CONCAT_KWARGS)
             else:
                 result = pa.Table.from_batches(scan_result).to_pandas(self_destruct=True)
         finally:
@@ -495,7 +533,7 @@ class DeltaSharingReader:
             )
             pdfs.append(pdf)
 
-        merged = pd.concat(pdfs, axis=0, ignore_index=True, copy=False)
+        merged = _concat_file_frames(pdfs)
 
         col_map = {}
         for col in merged.columns:
@@ -549,7 +587,7 @@ class DeltaSharingReader:
                     break
 
             print(f"Received {len(pdfs)} batches of data.")
-            pdf = pd.concat(pdfs, axis=0, ignore_index=True, copy=False)
+            pdf = pd.concat(pdfs, axis=0, ignore_index=True, **_CONCAT_KWARGS)
             if limit is not None:
                 pdf = pdf.head(limit)
         else:
